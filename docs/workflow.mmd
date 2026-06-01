@@ -1,0 +1,48 @@
+flowchart TD
+    A([Start: Sitemap Update Workflow]) --> B
+
+    B["Step 1: Pull Existing Sitemaps
+    Fetch sitemap URLs from robots.txt
+    -> sitemap_to_dataframe.py"]
+    B --> C
+
+    INPUT_FILE["Input File
+    Format: .txt or .csv
+    Contents: New URLs list
+    Expected column: url
+    Example: https://site.com/new-page"]
+
+    C["Step 2: Pull New URLs
+    Load new URLs from input file"]
+
+    INPUT_FILE --> C
+    B --> C
+    C --> D
+
+    D{"Step 3: Deduplicate URLs
+    Are new URLs already in
+    the sitemap dataframe?"}
+
+    D -- Yes --> E["Remove Duplicate URLs
+    Filter out existing URLs
+    from input list"]
+    D -- No --> F
+    E --> F
+
+    F["Step 3b + 4: Filter + Generate
+    Drop off-host URLs, then write
+    combined (existing + new) sitemap
+    -> sitemap_generator.py
+    -> validate_sitemap.py"]
+    F --> G
+
+    G["Step 5: Upload to GSC
+    Submit sitemap via GSC API
+    (confirmation-gated)
+    -> gsc_sitemap_uploader.py"]
+    G --> H
+
+    H{"Upload Successful?"}
+    H -- Yes --> I([Done: Sitemap Updated in GSC])
+    H -- No --> J["Log Error and Notify"]
+    J --> K([Retry or Manual Review])

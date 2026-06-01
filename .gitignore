@@ -1,0 +1,23 @@
+# Secrets — never commit GSC credentials or tokens
+client_secrets.json
+service_account.json
+gsc_token.json
+*.json.bak
+
+# Generated sitemap output
+sitemaps/
+sitemaps_*/
+out_*/
+manual/
+*.xml
+!examples/*.xml
+
+# Logs
+SITEMAP_LOG.md
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
