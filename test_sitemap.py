@@ -199,6 +199,37 @@ def test_trailing_slash_normalize(tmp):
           merged[0]["loc"] == "https://x.com/blog/post/", merged[0]["loc"])
 
 
+def test_refresh_lastmod(tmp):
+    today = "2026-06-07"
+    existing = [
+        {"loc": "https://x.com/a/", "lastmod": "2020-01-01"},  # had a date
+        {"loc": "https://x.com/b/"},                           # no date
+    ]
+    new = [
+        {"loc": "https://x.com/a/"},   # in input, had a date -> bump to today
+        {"loc": "https://x.com/b/"},   # in input, no prior date -> stays dateless
+        {"loc": "https://x.com/c/"},   # brand new -> appended, dateless
+    ]
+    merged, added, updated = merge_entries(existing, new, stamp_date=today)
+    by_loc = {m["loc"]: m for m in merged}
+    check("refresh: dated input URL bumped to today",
+          by_loc["https://x.com/a/"].get("lastmod") == today,
+          by_loc["https://x.com/a/"].get("lastmod"))
+    check("refresh: dateless input URL stays dateless",
+          "lastmod" not in by_loc["https://x.com/b/"] or
+          not by_loc["https://x.com/b/"].get("lastmod"))
+    check("refresh: brand-new URL added without date", added == 1, f"added={added}")
+    check("refresh: only the dated URL counts as updated", updated == 1, f"updated={updated}")
+
+    # explicit input lastmod still wins over the stamp
+    merged2, _, _ = merge_entries(
+        [{"loc": "https://x.com/a/", "lastmod": "2020-01-01"}],
+        [{"loc": "https://x.com/a/", "lastmod": "2025-12-31"}],
+        stamp_date=today)
+    check("refresh: explicit input date beats the stamp",
+          merged2[0]["lastmod"] == "2025-12-31", merged2[0]["lastmod"])
+
+
 def test_home_goes_to_pages(tmp):
     out = os.path.join(tmp, "home")
     urls = [
@@ -252,6 +283,7 @@ def main() -> int:
         test_validator_catches_bad(tmp)
         test_dedup_and_loader(tmp)
         test_trailing_slash_normalize(tmp)
+        test_refresh_lastmod(tmp)
         test_home_goes_to_pages(tmp)
         test_single_file(tmp)
     finally:

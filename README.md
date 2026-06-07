@@ -129,7 +129,7 @@ python sitemap_workflow.py update \
     --input examples/sample_urls.csv \
     --base-url https://www.example.com \
     --trailing-slash add \
-    --with-lastmod \
+    --refresh-lastmod --with-lastmod \
     --out ./sitemaps
 ```
 
@@ -179,6 +179,7 @@ python sitemap_workflow.py submit \
 | `--out` | `./sitemaps` | Output directory. |
 | `--trailing-slash` | `keep` | Normalize trailing slashes for dedupe **and** output: `add` forces a slash (`/blog` -> `/blog/`), `strip` removes it, `keep` leaves URLs untouched. Root, query/fragment, and file-like URLs (e.g. `.xml`) are never changed. |
 | `--single-file` | off | Write ONE flat `sitemap.xml` with all URLs — no child sitemaps, no index. Overrides `--group-by`. (Auto-splits + adds an index only past 50,000 URLs.) |
+| `--refresh-lastmod` | off | For input URLs that **already** have a `<lastmod>`, refresh it to today's generation date. An explicit lastmod in the input still wins; input URLs with no prior date stay dateless. Emit it with `--with-lastmod`. |
 | `--with-lastmod` | off | Emit `<lastmod>` when present in the data. |
 | `--legacy-tags` | off | Also emit `<changefreq>`/`<priority>` (Google ignores these). |
 
@@ -216,6 +217,9 @@ are never touched. Confirmation-gated by default; pass `--yes` in automation.
   exists, its `<lastmod>` is refreshed to the new value instead of creating a
   second entry.
 - **New URL -> appended.** Genuinely new URLs are added to the combined set.
+- **Refresh dates on demand.** With `--refresh-lastmod`, any input URL that
+  already had a `<lastmod>` gets re-stamped to today's generation date (an
+  explicit input date still wins; input URLs with no prior date stay dateless).
 - **Trailing slashes** are treated as significant by default (`/blog` and
   `/blog/` are different URLs). Use `--trailing-slash add|strip` to make dedupe
   slash-insensitive and emit one canonical form.

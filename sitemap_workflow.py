@@ -221,6 +221,7 @@ def merge_entries(
     existing: list[dict],
     new: list[dict],
     normalize=None,
+    stamp_date: str | None = None,
 ) -> tuple[list[dict], int, int]:
     """Merge `new` URLs into `existing`, identifying duplicates by <loc> ONLY
     (lastmod is never part of the identity check).
@@ -233,11 +234,17 @@ def merge_entries(
     before matching AND stored on the entry, so dedupe is slash-insensitive and
     the emitted URLs share one canonical form.
 
+    `stamp_date` (e.g. today's "YYYY-MM-DD"): when set, an input URL that matches
+    an existing entry which ALREADY had a <lastmod> gets that date refreshed to
+    `stamp_date`. An explicit lastmod in the input still takes precedence; input
+    URLs with no prior lastmod are left dateless.
+
     Returns (merged, added_count, updated_count). Original order is preserved:
     existing entries first (in place), then any genuinely new URLs appended."""
     norm = normalize or (lambda loc: loc)
     by_loc: dict[str, dict] = {}
     merged: list[dict] = []
+    had_lastmod: set[str] = set()         # locs that already carried a lastmod
     for e in existing:
         loc = norm(e["loc"])
         if loc in by_loc:
@@ -246,15 +253,23 @@ def merge_entries(
         ent["loc"] = loc
         by_loc[loc] = ent
         merged.append(ent)
+        if (ent.get("lastmod") or "").strip():
+            had_lastmod.add(loc)
 
     added = updated = 0
     for e in new:
         loc = norm(e["loc"])
         if loc in by_loc:                 # duplicate: update lastmod in place
             new_lm = (e.get("lastmod") or "").strip()
-            if new_lm and by_loc[loc].get("lastmod") != new_lm:
-                by_loc[loc]["lastmod"] = new_lm
-                updated += 1
+            if new_lm:                    # explicit input date wins
+                if by_loc[loc].get("lastmod") != new_lm:
+                    by_loc[loc]["lastmod"] = new_lm
+                    updated += 1
+            elif stamp_date and loc in had_lastmod:
+                # refresh previously-dated input URLs to the generation date
+                if by_loc[loc].get("lastmod") != stamp_date:
+                    by_loc[loc]["lastmod"] = stamp_date
+                    updated += 1
         else:                             # genuinely new URL
             ent = dict(e)
             ent["loc"] = loc
@@ -376,7 +391,10 @@ def cmd_update(args) -> int:
     existing = pull_existing(args.site)
     new = load_new_urls(args.input)
     normalize = make_normalizer(args.trailing_slash)
-    combined, added, updated = merge_entries(existing, new, normalize=normalize)
+    stamp = (datetime.now(timezone.utc).strftime("%Y-%m-%d")
+             if args.refresh_lastmod else None)
+    combined, added, updated = merge_entries(
+        existing, new, normalize=normalize, stamp_date=stamp)
 
     combined, dropped = filter_same_host(combined, base_url)
     if not combined:
@@ -400,6 +418,7 @@ def cmd_update(args) -> int:
     append_log([
         f"site: {args.site or '(none)'}  base_url: {base_url}",
         f"input: {args.input}  trailing-slash: {args.trailing_slash}  "
+        f"refresh-lastmod: {'on' if args.refresh_lastmod else 'off'}  "
         f"{'single-file' if args.single_file else 'group-by: ' + args.group_by}",
         f"existing: {len(existing)}  new: {len(new)}  added: {added}  "
         f"lastmod updated: {updated}  off-host dropped: {len(dropped)}  "
@@ -531,6 +550,10 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--single-file", dest="single_file", action="store_true",
                     help="Write ONE flat sitemap.xml with ALL URLs (no child sitemaps, no index). "
                          "Overrides --group-by.")
+    up.add_argument("--refresh-lastmod", dest="refresh_lastmod", action="store_true",
+                    help="For input URLs that ALREADY have a <lastmod>, refresh it to today's "
+                         "generation date. (An explicit lastmod in the input still wins; input "
+                         "URLs with no prior lastmod stay dateless. Needs --with-lastmod to emit.)")
     up.add_argument("--with-lastmod", action="store_true", help="Emit <lastmod> when present in the data")
     up.add_argument("--legacy-tags", action="store_true",
                     help="Also emit <changefreq>/<priority> (Google ignores these)")
