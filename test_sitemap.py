@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 
 from sitemap_generator import generate_sitemaps
 from validate_sitemap import validate, validate_path
-from sitemap_workflow import deduplicate, load_new_urls, GROUPERS
+from sitemap_workflow import merge_entries, make_normalizer, load_new_urls, GROUPERS
 
 PASS, FAIL = "  ✔", "  ✖"
 _failures = 0
@@ -152,16 +152,90 @@ def test_dedup_and_loader(tmp):
     with open(csv_path, "w", encoding="utf-8") as fh:
         fh.write("url,lastmod\n"
                  "https://example.com/new1,2024-05-01\n"
-                 "https://example.com/existing,2024-05-02\n"
-                 "https://example.com/new1,2024-05-01\n")   # internal dup
+                 "https://example.com/existing,2024-05-02\n"   # already in sitemap
+                 "https://example.com/new1,2024-05-01\n")      # internal dup
     new = load_new_urls(csv_path)
     check("loader: reads 3 rows", len(new) == 3, str(len(new)))
-    existing = [{"loc": "https://example.com/existing"}]
-    unique, removed = deduplicate(existing, new)
-    check("dedup: removes existing + internal dup", removed == 2 and len(unique) == 1,
-          f"removed={removed} unique={len(unique)}")
-    check("dedup: keeps the genuinely new URL",
-          unique and unique[0]["loc"] == "https://example.com/new1")
+
+    # existing "/existing" has an OLD lastmod that should be updated in place
+    existing = [{"loc": "https://example.com/existing", "lastmod": "2020-01-01"}]
+    merged, added, updated = merge_entries(existing, new)
+
+    check("merge: adds only the genuinely new URL", added == 1, f"added={added}")
+    check("merge: updates lastmod of the existing URL", updated == 1, f"updated={updated}")
+    check("merge: no duplicate entries (dedup by loc only)", len(merged) == 2,
+          f"len={len(merged)}")
+
+    by_loc = {m["loc"]: m for m in merged}
+    check("merge: existing URL kept once with NEW lastmod",
+          by_loc["https://example.com/existing"].get("lastmod") == "2024-05-02",
+          by_loc["https://example.com/existing"].get("lastmod"))
+    check("merge: new URL present",
+          "https://example.com/new1" in by_loc)
+
+
+def test_trailing_slash_normalize(tmp):
+    norm = make_normalizer("add")
+    check("norm/add: appends slash", norm("https://x.com/blog") == "https://x.com/blog/")
+    check("norm/add: idempotent", norm("https://x.com/blog/") == "https://x.com/blog/")
+    check("norm/add: root untouched", norm("https://x.com/") == "https://x.com/")
+    check("norm/add: file-like untouched",
+          norm("https://x.com/sitemap.xml") == "https://x.com/sitemap.xml")
+    check("norm/add: query untouched",
+          norm("https://x.com/p?a=1") == "https://x.com/p?a=1")
+
+    strip = make_normalizer("strip")
+    check("norm/strip: removes slash", strip("https://x.com/blog/") == "https://x.com/blog")
+
+    # slash-insensitive dedupe: existing has slash, CSV has none -> one entry,
+    # lastmod updated, NOT added as a new URL.
+    existing = [{"loc": "https://x.com/blog/post/", "lastmod": "2020-01-01"}]
+    new = [{"loc": "https://x.com/blog/post", "lastmod": "2026-06-06"}]  # no slash
+    merged, added, updated = merge_entries(existing, new, normalize=norm)
+    check("norm: slash variant deduped (not added)", added == 0, f"added={added}")
+    check("norm: lastmod updated on dedupe", updated == 1, f"updated={updated}")
+    check("norm: single canonical entry kept", len(merged) == 1, f"len={len(merged)}")
+    check("norm: emitted URL uses trailing-slash form",
+          merged[0]["loc"] == "https://x.com/blog/post/", merged[0]["loc"])
+
+
+def test_home_goes_to_pages(tmp):
+    out = os.path.join(tmp, "home")
+    urls = [
+        {"loc": "https://example.com/"},                 # home → pages
+        {"loc": "https://example.com/blog/post-1"},
+        {"loc": "https://example.com/blog/post-2"},
+    ]
+    result = generate_sitemaps(urls=urls, depth=1, output_dir=out,
+                               base_url="https://example.com", min_urls_per_group=2)
+    check("home: a sitemap_pages.xml is produced",
+          "sitemap_pages.xml" in result["sitemap_files"],
+          str(result["sitemap_files"]))
+    pages_xml = open(os.path.join(out, "sitemap_pages.xml"), encoding="utf-8").read()
+    check("home: root URL lives in pages sitemap",
+          "<loc>https://example.com/</loc>" in pages_xml, pages_xml)
+    # home must NOT be merged into 'other' or land in the blog sitemap
+    blog_xml = open(os.path.join(out, "sitemap_blog.xml"), encoding="utf-8").read()
+    check("home: root URL NOT in blog sitemap",
+          "<loc>https://example.com/</loc>" not in blog_xml)
+
+
+def test_single_file(tmp):
+    out = os.path.join(tmp, "single")
+    urls = [
+        {"loc": "https://example.com/"},
+        {"loc": "https://example.com/blog/post-1"},
+        {"loc": "https://example.com/seo/x"},
+    ]
+    result = generate_sitemaps(urls=urls, depth=1, output_dir=out,
+                               base_url="https://example.com", single_file=True)
+    check("single: exactly one flat sitemap.xml",
+          result["sitemap_files"] == ["sitemap.xml"], str(result["sitemap_files"]))
+    check("single: no index file produced", result["index_files"] == [],
+          str(result["index_files"]))
+    flat = open(os.path.join(out, "sitemap.xml"), encoding="utf-8").read()
+    check("single: all 3 URLs in one file", flat.count("<loc>") == 3,
+          str(flat.count("<loc>")))
 
 
 def main() -> int:
@@ -177,6 +251,9 @@ def main() -> int:
         test_generated_is_valid(tmp)
         test_validator_catches_bad(tmp)
         test_dedup_and_loader(tmp)
+        test_trailing_slash_normalize(tmp)
+        test_home_goes_to_pages(tmp)
+        test_single_file(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

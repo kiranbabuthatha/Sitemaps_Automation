@@ -49,6 +49,10 @@ GOOGLE_MAX_URLS_PER_SITEMAP   = 50_000
 GOOGLE_MAX_SITEMAPS_PER_INDEX = 50_000
 GOOGLE_MAX_BYTES_PER_SITEMAP  = 50 * 1024 * 1024   # 50 MB
 
+# The home / root URL ("https://site/" or "https://site") always lands in this
+# group so it ends up in the core pages sitemap, never in blog/product/other.
+HOME_GROUP = "pages"
+
 
 # ─────────────────────────────────────────────
 # Public API
@@ -67,6 +71,7 @@ def generate_sitemaps(
     group_func: Optional[Callable[[str, dict], str]] = None,
     emit_changefreq: bool = False,
     emit_priority: bool = False,
+    single_file: bool = False,
 ) -> dict:
     """
     Parameters
@@ -123,21 +128,35 @@ def generate_sitemaps(
         emit_changefreq=emit_changefreq, emit_priority=emit_priority,
     )
 
-    # ── 2. Group: custom group_func if given, else path prefix at `depth` ─
+    # ── 2. Group ─────────────────────────────────────────────────────────
+    #   single_file  → one flat sitemap, everything in one bucket
+    #   home/root URL → always forced into HOME_GROUP ("pages")
+    #   otherwise    → custom group_func if given, else path prefix at `depth`
     groups: dict[str, list] = defaultdict(list)
-    for entry in entries:
-        if group_func is not None:
-            key = str(group_func(entry["loc"], entry)) or "other"
-        else:
-            key = _group_key(entry["loc"], depth)
-        groups[key].append(entry)
+    if single_file:
+        groups["__all__"] = list(entries)
+    else:
+        for entry in entries:
+            if _is_home(entry["loc"]):
+                key = HOME_GROUP
+            elif group_func is not None:
+                key = str(group_func(entry["loc"], entry)) or "other"
+            else:
+                key = _group_key(entry["loc"], depth)
+            groups[key].append(entry)
 
     # ── 3. Merge small groups ────────────────────────────────────────────
     #   • Find groups whose URL count < min_urls_per_group
     #   • Compute the "other" bucket name  = depth-1 segments of a
     #     representative URL from that group  (strip dot-suffixes)
     #   • All small groups collapse into that single bucket
-    small_keys   = [k for k, v in groups.items() if len(v) < min_urls_per_group]
+    #   • HOME_GROUP is protected: the home page never gets merged away,
+    #     and single_file mode skips merging entirely.
+    small_keys   = (
+        [] if single_file
+        else [k for k, v in groups.items()
+              if len(v) < min_urls_per_group and k != HOME_GROUP]
+    )
     merged_into  = {}          # small_key → other_key  (for reporting)
 
     if small_keys:
@@ -169,37 +188,54 @@ def generate_sitemaps(
             print(f"      '{k}' absorbed")
 
     # ── 4. Write one (or more) .xml per group ───────────────────────────
+    #   single_file → flat "{prefix}.xml" (split into "{prefix}_N.xml" only if
+    #   it overflows Google's 50k-per-file limit).
     sitemap_files: list[str] = []
 
-    for group_key in sorted(groups):
-        group_entries = groups[group_key]
-        chunks        = _split(group_entries, max_urls)
-
+    if single_file:
+        chunks = _split(groups["__all__"], max_urls)
         for chunk_idx, chunk in enumerate(chunks):
             filename = (
-                f"{prefix}_{group_key}.xml"
+                f"{prefix}.xml"
                 if len(chunks) == 1
-                else f"{prefix}_{group_key}_{chunk_idx}.xml"
+                else f"{prefix}_{chunk_idx}.xml"
             )
-            filepath = os.path.join(output_dir, filename)
-            _write_urlset(chunk, filepath)
+            _write_urlset(chunk, os.path.join(output_dir, filename))
             sitemap_files.append(filename)
             print(f"  ✔ {filename}  ({len(chunk):,} URLs)")
+    else:
+        for group_key in sorted(groups):
+            group_entries = groups[group_key]
+            chunks        = _split(group_entries, max_urls)
+
+            for chunk_idx, chunk in enumerate(chunks):
+                filename = (
+                    f"{prefix}_{group_key}.xml"
+                    if len(chunks) == 1
+                    else f"{prefix}_{group_key}_{chunk_idx}.xml"
+                )
+                filepath = os.path.join(output_dir, filename)
+                _write_urlset(chunk, filepath)
+                sitemap_files.append(filename)
+                print(f"  ✔ {filename}  ({len(chunk):,} URLs)")
 
     # ── 5. Write sitemap-index file(s) ──────────────────────────────────
-    index_chunks = _split(sitemap_files, GOOGLE_MAX_SITEMAPS_PER_INDEX)
+    #   A lone flat sitemap needs no index; everything else gets one.
     index_files: list[str] = []
-
-    for idx, idx_chunk in enumerate(index_chunks):
-        index_filename = (
-            f"{prefix}_index.xml"
-            if len(index_chunks) == 1
-            else f"{prefix}_index_{idx}.xml"
-        )
-        index_filepath = os.path.join(output_dir, index_filename)
-        _write_sitemapindex(idx_chunk, index_filepath, base_url)
-        index_files.append(index_filename)
-        print(f"  ✔ {index_filename}  ({len(idx_chunk):,} sitemaps)")
+    if single_file and len(sitemap_files) <= 1:
+        pass
+    else:
+        index_chunks = _split(sitemap_files, GOOGLE_MAX_SITEMAPS_PER_INDEX)
+        for idx, idx_chunk in enumerate(index_chunks):
+            index_filename = (
+                f"{prefix}_index.xml"
+                if len(index_chunks) == 1
+                else f"{prefix}_index_{idx}.xml"
+            )
+            index_filepath = os.path.join(output_dir, index_filename)
+            _write_sitemapindex(idx_chunk, index_filepath, base_url)
+            index_files.append(index_filename)
+            print(f"  ✔ {index_filename}  ({len(idx_chunk):,} sitemaps)")
 
     summary = {
         "sitemap_files":  sitemap_files,
@@ -219,6 +255,12 @@ def generate_sitemaps(
 # ─────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────
+
+def _is_home(url: str) -> bool:
+    """True for the site root, e.g. 'https://site.com' or 'https://site.com/'.
+    Such URLs have an empty path once leading/trailing slashes are stripped."""
+    return urlparse(url).path.strip("/") == ""
+
 
 def _clean_segment(segment: str) -> str:
     """Strip everything after the first '.' in a path segment.

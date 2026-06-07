@@ -1,9 +1,10 @@
 # Sitemap Update Automation
 
 A small, domain-agnostic toolkit to keep XML sitemaps current. It pulls a site's
-existing sitemap URLs, merges in a list of new URLs, deduplicates, regenerates
-**fresh Google-compliant sitemaps**, validates them, and (optionally, behind a
-confirmation prompt) submits them to Google Search Console.
+existing sitemap URLs, merges in a list of new URLs (deduping by URL only and
+refreshing `<lastmod>` dates in place), regenerates **fresh Google-compliant
+sitemaps**, validates them, and (optionally, behind a confirmation prompt)
+submits them to Google Search Console.
 
 Works on any domain. Nothing is hardcoded to one site.
 
@@ -24,9 +25,11 @@ Works on any domain. Nothing is hardcoded to one site.
 Start
   1. Pull existing sitemaps from robots.txt        -> sitemap_to_dataframe.py
   2. Load new URLs from an input file (.csv/.txt)
-  3. Deduplicate (drop new URLs already live)
+  3. Merge by URL only: update <lastmod> in place for URLs that already
+     exist, append genuinely new ones (optional trailing-slash normalization)
   3b. Drop off-host URLs (Google requires one host per sitemap)
   4. Generate combined (existing + new) sitemaps   -> sitemap_generator.py
+     (home/root URL always lands in the pages sitemap; or one flat file)
      then validate the output                      -> validate_sitemap.py
   5. Upload to GSC (separate, confirmation-gated)   -> gsc_sitemap_uploader.py
 Done  |  on failure: log + notify -> retry / manual review
@@ -54,13 +57,13 @@ flowchart TD
     B --> C
     C --> D
 
-    D{"Step 3: Deduplicate URLs
-    Are new URLs already in
-    the sitemap dataframe?"}
+    D{"Step 3: Merge URLs (by loc only)
+    Is the new URL already
+    in the existing set?"}
 
-    D -- Yes --> E["Remove Duplicate URLs
-    Filter out existing URLs
-    from input list"]
+    D -- Yes --> E["Update lastmod in place
+    Refresh the date on the
+    existing entry (no duplicate)"]
     D -- No --> F
     E --> F
 
@@ -117,10 +120,36 @@ python sitemap_workflow.py update \
     --out ./sitemaps
 ```
 
+Start completely fresh (wipe old output, then regenerate):
+
+```bash
+python sitemap_workflow.py clean --out ./sitemaps --yes
+python sitemap_workflow.py update \
+    --site https://www.example.com \
+    --input examples/sample_urls.csv \
+    --base-url https://www.example.com \
+    --trailing-slash add \
+    --with-lastmod \
+    --out ./sitemaps
+```
+
+Or generate a single flat `sitemap.xml` instead of grouped child sitemaps:
+
+```bash
+python sitemap_workflow.py update \
+    --site https://www.example.com \
+    --input examples/sample_urls.csv \
+    --base-url https://www.example.com \
+    --single-file --with-lastmod \
+    --out ./sitemaps
+```
+
 Validate the result:
 
 ```bash
 python sitemap_workflow.py validate ./sitemaps/sitemap_index.xml
+# (for --single-file there is no index; validate the file directly)
+python sitemap_workflow.py validate ./sitemaps/sitemap.xml
 ```
 
 Submit to Google Search Console (asks for confirmation; writes to your live
@@ -148,6 +177,8 @@ python sitemap_workflow.py submit \
 | `--min-urls-per-group` | `2` | Groups smaller than this merge into `other`. |
 | `--prefix` | `sitemap` | Output filename prefix. |
 | `--out` | `./sitemaps` | Output directory. |
+| `--trailing-slash` | `keep` | Normalize trailing slashes for dedupe **and** output: `add` forces a slash (`/blog` -> `/blog/`), `strip` removes it, `keep` leaves URLs untouched. Root, query/fragment, and file-like URLs (e.g. `.xml`) are never changed. |
+| `--single-file` | off | Write ONE flat `sitemap.xml` with all URLs — no child sitemaps, no index. Overrides `--group-by`. (Auto-splits + adds an index only past 50,000 URLs.) |
 | `--with-lastmod` | off | Emit `<lastmod>` when present in the data. |
 | `--legacy-tags` | off | Also emit `<changefreq>`/`<priority>` (Google ignores these). |
 
@@ -166,6 +197,36 @@ URLs and 50 MB per file, max 2,048-char URLs, valid W3C `lastmod`, no duplicates
 Confirmation-gated by default; pass `--yes` to skip the prompt in automation.
 Never runs as part of `update`.
 
+### `clean` — wipe generated artifacts for a fresh run
+
+```bash
+python sitemap_workflow.py clean --out ./sitemaps         # asks to confirm
+python sitemap_workflow.py clean --out ./sitemaps --yes   # no prompt
+```
+
+Deletes the output directory, the run log (`SITEMAP_LOG.md`), and `__pycache__`.
+It only removes **generated** files — your source, input CSVs, and credentials
+are never touched. Confirmation-gated by default; pass `--yes` in automation.
+
+## Merge & dedupe behavior
+
+- **Dedupe is by `<loc>` only.** Two entries are "the same URL" purely by their
+  location; `<lastmod>` is never part of the identity check.
+- **Existing URL + new entry -> updated in place.** If an incoming URL already
+  exists, its `<lastmod>` is refreshed to the new value instead of creating a
+  second entry.
+- **New URL -> appended.** Genuinely new URLs are added to the combined set.
+- **Trailing slashes** are treated as significant by default (`/blog` and
+  `/blog/` are different URLs). Use `--trailing-slash add|strip` to make dedupe
+  slash-insensitive and emit one canonical form.
+
+## Home / root URL placement
+
+The site root (`https://site.com/` or `https://site.com`) is always routed to
+the **pages** sitemap (`sitemap_pages.xml`), regardless of grouping strategy,
+and is protected from the small-group merge — so your home page never gets
+buried in `blog`, `seo`, or `other`.
+
 ## Grouping strategies (`--group-by`)
 
 | Strategy | One sitemap per... |
@@ -178,6 +239,10 @@ Never runs as part of `update`.
 Add your own by dropping a function into `GROUPERS` in `sitemap_workflow.py`
 with signature `group_func(url: str, entry: dict) -> str`, or by calling
 `generate_sitemaps(..., group_func=...)` directly.
+
+> `--group-by single` still writes one urlset (`sitemap_all.xml`) **plus** a
+> sitemap index. If you want a single bare `sitemap.xml` with **no** index, use
+> the `--single-file` flag instead.
 
 ## Input file format
 
@@ -203,6 +268,12 @@ Or a plain `.txt`, one URL per line (`#` lines ignored).
 - **Jupyter `argparse` error mentioning `ipykernel_launcher.py`.** You called
   `main()` without passing the argument list. Use `wf.main([...])`, or shell out
   with `!python sitemap_workflow.py update ...`.
+- **Windows `UnicodeEncodeError` on the `🚀`/`✔` output.** The default console
+  codec (cp1252) can't print the status emoji. Force UTF-8 for the run:
+  `set PYTHONUTF8=1` (cmd) or `$env:PYTHONUTF8=1` (PowerShell), then run as usual.
+- **A page appears twice (with and without a trailing slash).** `/page` and
+  `/page/` are distinct URLs by default. Run with `--trailing-slash add` (or
+  `strip`) to collapse them into one canonical entry.
 
 ## Files
 

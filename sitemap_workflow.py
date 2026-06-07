@@ -64,9 +64,10 @@ from __future__ import annotations
 import os
 import sys
 import csv
+import shutil
 import argparse
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 # Local modules (all in this folder)
 from sitemap_generator import generate_sitemaps
@@ -178,25 +179,92 @@ def load_new_urls(input_path: str) -> list[dict]:
 
 
 # ─────────────────────────────────────────────
-# Step 3: deduplicate
+# Trailing-slash normalization
 # ─────────────────────────────────────────────
 
-def deduplicate(existing: list[dict], new: list[dict]) -> tuple[list[dict], int]:
-    """Return (new_unique, removed_count). A new URL is a duplicate if its
-    loc already appears in the existing set."""
-    existing_locs = {e["loc"] for e in existing}
-    seen_new: set[str] = set()
-    unique: list[dict] = []
-    removed = 0
+def make_normalizer(mode: str):
+    """Return a function loc -> loc that normalizes trailing slashes.
+
+    mode:
+      "keep"  -> identity (URLs untouched; exact-match dedupe)
+      "add"   -> force a trailing slash  (/blog -> /blog/)
+      "strip" -> remove a trailing slash (/blog/ -> /blog)
+
+    The root ('/'), URLs with a query or fragment, and file-like last segments
+    (anything with a '.', e.g. /sitemap.xml, /a.pdf) are ALWAYS left untouched,
+    since rewriting those would change their meaning."""
+    if mode not in ("keep", "add", "strip"):
+        raise ValueError(f"unknown trailing-slash mode '{mode}'")
+    if mode == "keep":
+        return lambda loc: loc
+
+    def normalize(loc: str) -> str:
+        p = urlparse(loc)
+        path = p.path
+        last = path.rsplit("/", 1)[-1]
+        if path in ("", "/") or p.query or p.fragment or "." in last:
+            return loc                              # leave special cases alone
+        if mode == "add" and not path.endswith("/"):
+            path += "/"
+        elif mode == "strip":
+            path = path.rstrip("/") or "/"
+        return urlunparse((p.scheme, p.netloc, path, p.params, p.query, p.fragment))
+
+    return normalize
+
+
+# ─────────────────────────────────────────────
+# Step 3: merge new URLs into existing (dedupe by loc only)
+# ─────────────────────────────────────────────
+
+def merge_entries(
+    existing: list[dict],
+    new: list[dict],
+    normalize=None,
+) -> tuple[list[dict], int, int]:
+    """Merge `new` URLs into `existing`, identifying duplicates by <loc> ONLY
+    (lastmod is never part of the identity check).
+
+    - URL already present  -> update its <lastmod> in place with the new value
+                              (does not create a second entry).
+    - URL not present       -> append as a new entry.
+
+    `normalize` (loc -> loc, e.g. from make_normalizer) is applied to every loc
+    before matching AND stored on the entry, so dedupe is slash-insensitive and
+    the emitted URLs share one canonical form.
+
+    Returns (merged, added_count, updated_count). Original order is preserved:
+    existing entries first (in place), then any genuinely new URLs appended."""
+    norm = normalize or (lambda loc: loc)
+    by_loc: dict[str, dict] = {}
+    merged: list[dict] = []
+    for e in existing:
+        loc = norm(e["loc"])
+        if loc in by_loc:
+            continue                      # collapse any pre-existing dupes
+        ent = dict(e)
+        ent["loc"] = loc
+        by_loc[loc] = ent
+        merged.append(ent)
+
+    added = updated = 0
     for e in new:
-        loc = e["loc"]
-        if loc in existing_locs or loc in seen_new:
-            removed += 1
-            continue
-        seen_new.add(loc)
-        unique.append(e)
-    print(f"  Step 3: {removed} duplicate(s) removed, {len(unique)} new unique URL(s)")
-    return unique, removed
+        loc = norm(e["loc"])
+        if loc in by_loc:                 # duplicate: update lastmod in place
+            new_lm = (e.get("lastmod") or "").strip()
+            if new_lm and by_loc[loc].get("lastmod") != new_lm:
+                by_loc[loc]["lastmod"] = new_lm
+                updated += 1
+        else:                             # genuinely new URL
+            ent = dict(e)
+            ent["loc"] = loc
+            by_loc[loc] = ent
+            merged.append(ent)
+            added += 1
+
+    print(f"  Step 3: {added} new URL(s) added, {updated} existing URL(s) "
+          f"had lastmod updated  (deduped by URL only, lastmod ignored for matching)")
+    return merged, added, updated
 
 
 # ─────────────────────────────────────────────
@@ -237,6 +305,7 @@ def generate(
     prefix: str,
     with_lastmod: bool,
     emit_legacy_tags: bool,
+    single_file: bool = False,
 ) -> dict:
     if group_by not in GROUPERS:
         raise ValueError(f"unknown --group-by '{group_by}'. "
@@ -246,8 +315,11 @@ def generate(
         entries = [{k: v for k, v in e.items() if k != "lastmod"} for e in entries]
 
     group_func = GROUPERS[group_by]
-    print(f"  Step 4: generating sitemaps  (group-by={group_by}"
-          f"{', depth=' + str(depth) if group_by == 'path_depth' else ''})")
+    if single_file:
+        print(f"  Step 4: generating ONE flat sitemap ({prefix}.xml) with all URLs")
+    else:
+        print(f"  Step 4: generating sitemaps  (group-by={group_by}"
+              f"{', depth=' + str(depth) if group_by == 'path_depth' else ''})")
 
     result = generate_sitemaps(
         urls=entries,
@@ -259,6 +331,7 @@ def generate(
         group_func=group_func,
         emit_changefreq=emit_legacy_tags,
         emit_priority=emit_legacy_tags,
+        single_file=single_file,
     )
     return result
 
@@ -302,9 +375,9 @@ def cmd_update(args) -> int:
 
     existing = pull_existing(args.site)
     new = load_new_urls(args.input)
-    unique, removed = deduplicate(existing, new)
+    normalize = make_normalizer(args.trailing_slash)
+    combined, added, updated = merge_entries(existing, new, normalize=normalize)
 
-    combined = existing + unique
     combined, dropped = filter_same_host(combined, base_url)
     if not combined:
         print("  ✖ nothing to write: no same-host URLs remain")
@@ -320,14 +393,16 @@ def cmd_update(args) -> int:
         prefix=args.prefix,
         with_lastmod=args.with_lastmod,
         emit_legacy_tags=args.legacy_tags,
+        single_file=args.single_file,
     )
     valid = validate_outputs(args.out, result)
 
     append_log([
         f"site: {args.site or '(none)'}  base_url: {base_url}",
-        f"input: {args.input}  group-by: {args.group_by}",
-        f"existing: {len(existing)}  new: {len(new)}  duplicates removed: {removed}  "
-        f"new unique: {len(unique)}  off-host dropped: {len(dropped)}  "
+        f"input: {args.input}  trailing-slash: {args.trailing_slash}  "
+        f"{'single-file' if args.single_file else 'group-by: ' + args.group_by}",
+        f"existing: {len(existing)}  new: {len(new)}  added: {added}  "
+        f"lastmod updated: {updated}  off-host dropped: {len(dropped)}  "
         f"total written: {result['total_urls']}",
         f"sitemaps: {len(result['sitemap_files'])}  index files: {len(result['index_files'])}",
         f"validation: {'PASS' if valid else 'FAIL'}",
@@ -342,6 +417,40 @@ def cmd_update(args) -> int:
 def cmd_validate(args) -> int:
     ok = validate_path(args.source, recurse=args.recurse)
     return 0 if ok else 1
+
+
+def cmd_clean(args) -> int:
+    """Remove generated artifacts so the next run starts fresh.
+
+    Deletes the output directory, the run log, and __pycache__. Only touches
+    generated files — never your source, input CSVs, or credentials."""
+    targets = [args.out, LOG_FILE, "__pycache__"]
+    existing = [t for t in targets if os.path.exists(t)]
+
+    if not existing:
+        print("  Nothing to clean — no generated artifacts found.")
+        return 0
+
+    print("\n  🧹 About to delete:")
+    for t in existing:
+        kind = "dir " if os.path.isdir(t) else "file"
+        print(f"     - [{kind}] {t}")
+
+    if not args.yes:
+        ans = input("\n  Type 'yes' to delete: ").strip().lower()
+        if ans != "yes":
+            print("  Aborted. Nothing deleted.")
+            return 1
+
+    for t in existing:
+        if os.path.isdir(t):
+            shutil.rmtree(t, ignore_errors=True)
+        else:
+            os.remove(t)
+        print(f"  ✔ removed {t}")
+
+    print("\n  Done. Re-run `update` for a fresh build.")
+    return 0
 
 
 def cmd_submit(args) -> int:
@@ -413,9 +522,48 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--min-urls-per-group", type=int, default=2, help="Merge groups smaller than this into 'other'")
     up.add_argument("--prefix", default="sitemap", help="Output filename prefix")
     up.add_argument("--out", default="./sitemaps", help="Output directory")
+    up.add_argument("--trailing-slash", dest="trailing_slash",
+                    choices=["keep", "add", "strip"], default="keep",
+                    help="Normalize trailing slashes for dedupe AND output. "
+                         "'add' forces a trailing slash, 'strip' removes it, "
+                         "'keep' leaves URLs untouched (default). Root, query/"
+                         "fragment, and file-like URLs (e.g. .xml) are never changed.")
+    up.add_argument("--single-file", dest="single_file", action="store_true",
+                    help="Write ONE flat sitemap.xml with ALL URLs (no child sitemaps, no index). "
+                         "Overrides --group-by.")
     up.add_argument("--with-lastmod", action="store_true", help="Emit <lastmod> when present in the data")
     up.add_argument("--legacy-tags", action="store_true",
                     help="Also emit <changefreq>/<priority> (Google ignores these)")
     up.set_defaults(func=cmd_update)
 
-    va = su
+    va = sub.add_parser("validate", help="Validate a sitemap or sitemap index (local path or URL)")
+    va.add_argument("source", help="Path or URL to a sitemap / sitemap index")
+    va.add_argument("--recurse", action="store_true", help="Follow and validate child sitemaps of an index")
+    va.set_defaults(func=cmd_validate)
+
+    sm = sub.add_parser("submit", help="Step 5: submit sitemaps to Google Search Console (confirmation-gated)")
+    sm.add_argument("--site", required=True, help="GSC property URL (e.g. https://example.com/)")
+    sm.add_argument("--out", default="./sitemaps", help="Directory holding the generated .xml sitemaps")
+    sm.add_argument("--base-url", default="", help="Absolute base used to build sitemap URLs for submission")
+    sm.add_argument("--credentials", default="client_secrets.json", help="Path to credentials JSON")
+    sm.add_argument("--auth-mode", default="oauth", choices=["oauth", "service_account"],
+                    help="Authentication mode for GSC")
+    sm.add_argument("--yes", action="store_true", help="Skip the interactive confirmation prompt")
+    sm.set_defaults(func=cmd_submit)
+
+    cl = sub.add_parser("clean", help="Delete generated artifacts (output dir, log, __pycache__) for a fresh run")
+    cl.add_argument("--out", default="./sitemaps", help="Output directory to remove (default: ./sitemaps)")
+    cl.add_argument("--yes", action="store_true", help="Skip the interactive confirmation prompt")
+    cl.set_defaults(func=cmd_clean)
+
+    return p
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
