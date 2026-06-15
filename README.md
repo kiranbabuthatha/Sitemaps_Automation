@@ -301,6 +301,11 @@ requirements.txt           Dependencies
   git-ignored. Never commit credentials.
 - Every run appends a summary to `SITEMAP_LOG.md` (git-ignored).
 
+## Further reading
+
+For a detailed walkthrough of how this toolkit works and the design decisions behind it, see the companion blog post:
+**[Automating XML Sitemap Generation with Python](https://kiranbabuthatha.com/blog/automating-xml-sitemap-generation-with-python/)**
+
 ## Hire me / full automation
 
 This toolkit covers the manual workflow. If you want your sitemaps maintained
